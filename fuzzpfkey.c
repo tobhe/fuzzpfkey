@@ -14,7 +14,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
 #include <err.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,32 +22,24 @@
 #include <string.h>
 #include <fcntl.h>
 
-#include <sys/socket.h>
+#include <sys/types.h>
 #include <net/pfkeyv2.h>
 #include <sys/shm.h>
 #include <sys/ioctl.h>
 #include <sys/kcov.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 
 #include "siphash.h"
 
-#define PFATAL(x...)                                                           \
-	do {                                                                   \
-		fprintf(stderr, "[-] SYSTEM ERROR : " x);                      \
-		fprintf(stderr, "\n\tLocation : %s(), %s:%u\n", __FUNCTION__,  \
-			__FILE__, __LINE__);                                   \
-		perror("      OS message ");                                   \
-		fprintf(stderr, "\n");                                         \
-		exit(EXIT_FAILURE);                                            \
-	} while (0)
-
 struct kcov {
-	int fd;
-	unsigned long  size;
-	unsigned long *cover;
+	int		 fd;
+	unsigned long	 size;
+	unsigned long	*cover;
 };
 
-struct kcov *kcov_new(void)
+struct kcov *
+kcov_new(void)
 {
 	struct kcov *k;
 	int fd;
@@ -57,16 +48,16 @@ struct kcov *kcov_new(void)
 
 	fd = open("/dev/kcov", O_RDWR);
 	if (fd == -1)
-		PFATAL("open(/dev/kcov)");
+		err(1, "open(/dev/kcov)");
 
 	if (ioctl(fd, KIOSETBUFSIZE, &size) == -1)
-		PFATAL("ioctl(KIOSETBUFSIZE)");
+		err(1, "ioctl(KIOSETBUFSIZE)");
 
 	/* Mmap buffer shared between kernel- and user-space. */
 	cover = mmap(NULL, size * sizeof(unsigned long),
 	    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (cover == MAP_FAILED) {
-		PFATAL("mmap");
+		err(1, "mmap");
 	}
 
 	k = calloc(1, sizeof(struct kcov));
@@ -76,30 +67,24 @@ struct kcov *kcov_new(void)
 	return k;
 }
 
-void kcov_enable(struct kcov *kcov)
+void
+kcov_enable(struct kcov *kcov)
 {
 	/* reset counter */
 	__atomic_store_n(&kcov->cover[0], 0, __ATOMIC_RELAXED);
 	int mode = KCOV_MODE_TRACE_PC;
 
 	if (ioctl(kcov->fd, KIOENABLE, &mode) != 0)
-		PFATAL("ioctl(KIOENABLE)");
-
-	/* Reset coverage. */
-	__atomic_store_n(&kcov->cover[0], 0, __ATOMIC_RELAXED);
-	__sync_synchronize();
+		err(1, "ioctl(KIOENABLE)");
 }
 
 int kcov_disable(struct kcov *kcov)
 {
-	/* Stop counter */
-	__sync_synchronize();
-
 	int kcov_len = __atomic_load_n(&kcov->cover[0], __ATOMIC_RELAXED);
 
 	/* Stop actual couting. */
 	if (ioctl(kcov->fd, KIODISABLE) != 0)
-		PFATAL("ioctl(KCOV_DISABLE)");
+		err(1, "ioctl(KCOV_DISABLE)");
 
 	return kcov_len;
 }
@@ -112,7 +97,10 @@ void kcov_free(struct kcov *kcov)
 	kcov->cover = MAP_FAILED;
 }
 
-unsigned long *kcov_cover(struct kcov *kcov) { return kcov->cover; }
+unsigned long *kcov_cover(struct kcov *kcov)
+{
+	return kcov->cover;
+}
 
 void
 print_hex(char *buf, size_t len)
@@ -139,46 +127,47 @@ main(int argc, char **argv)
 	uint8_t		*afl_shared = NULL;
 	const char	*afl_shm_id_str;
 	uint64_t	 previous;
-	int		 sock;
+	int		 sock, kcov_len;
 	char		 inbuf[512*1024] = {0} ;
 	size_t		 inlen, slen;
 	int i;
 
 	k = kcov_new();
 	if (k == NULL)
-		err(1, "kcov_new");
+		errx(1, "kcov_new");
 
 	kbuf = kcov_cover(k);
 
 	afl_shm_id_str = getenv("__AFL_SHM_ID");
-	if (afl_shm_idr_str != NULL) {
+	if (afl_shm_id_str != NULL) {
 		int afl_shm_id = atoi(afl_shm_id_str);
 		afl_shared = shmat(afl_shm_id, NULL, 0);
 	}
+	printf("afl_shared: %p\n", afl_shared);
 
 	/* get input */
 	inlen = read(0, inbuf, sizeof(inbuf));
-	if (inlen <= 16)
-		err(1, "read");
 
 	/* OpenBSD expects a valid PID */
 	uint32_t pid = getpid();
 	memcpy(inbuf + 12, &pid, sizeof(pid));
-	}
 
 	kcov_enable(k);
 
 	sock = socket(PF_KEY, SOCK_RAW, PF_KEY_V2);
-	if (sock == -1)
+	if (sock == -1) {
 		err(1, "sock");
+		goto done;
+	}
 
 	printf("inbuf: ");
 	print_hex(inbuf, inlen);
 	slen = send(sock, inbuf, inlen, 0);
 	if (slen == -1)
-		printf("send()");
+		printf("send()\n");
 
-	int kcov_len = kcov_disable(k);
+ done:
+	kcov_len = kcov_disable(k);
 
 	/* write output */
 	previous = 0;

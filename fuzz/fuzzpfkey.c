@@ -23,12 +23,20 @@
 #include <fcntl.h>
 
 #include <sys/types.h>
-#include <net/pfkeyv2.h>
 #include <sys/shm.h>
 #include <sys/ioctl.h>
-#include <sys/kcov.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+
+#ifdef __OpenBSD__
+#include <net/pfkeyv2.h>
+#include <sys/kcov.h>
+#endif /* OpenBSD */
+
+#ifdef __linux__
+#include <linux/pfkeyv2.h>
+#include <linux/kcov.h>
+#endif /* linux */
 
 #include "siphash.h"
 
@@ -43,15 +51,22 @@ kcov_new(void)
 {
 	struct kcov *k;
 	int fd;
-	unsigned long  size = 1024;
+	const unsigned long  size = 1024;
 	unsigned long *cover;
 
+#if defined(__OpenBSD__)
 	fd = open("/dev/kcov", O_RDWR);
 	if (fd == -1)
 		err(1, "open(/dev/kcov)");
-
 	if (ioctl(fd, KIOSETBUFSIZE, &size) == -1)
 		err(1, "ioctl(KIOSETBUFSIZE)");
+#elif defined(__linux__)
+	fd = open("/sys/kernel/debug/kcov", O_RDWR);
+	if (fd == -1)
+		err(1, "open(/sys/kernel/debug/kcov)");
+	if (ioctl(fd, KCOV_INIT_TRACE, size))
+		err(1, "ioctl(KOV_INIT_TRACE)");
+#endif
 
 	/* Mmap buffer shared between kernel- and user-space. */
 	cover = mmap(NULL, size * sizeof(unsigned long),
@@ -72,10 +87,15 @@ kcov_enable(struct kcov *kcov)
 {
 	/* reset counter */
 	__atomic_store_n(&kcov->cover[0], 0, __ATOMIC_RELAXED);
-	int mode = KCOV_MODE_TRACE_PC;
 
+#if defined(__OpenBSD__)
+	int mode = KCOV_MODE_TRACE_PC;
 	if (ioctl(kcov->fd, KIOENABLE, &mode) != 0)
 		err(1, "ioctl(KIOENABLE)");
+#elif defined(__linux__)
+	if (ioctl(kcov->fd, KCOV_ENABLE, KCOV_TRACE_PC) != 0)
+		err(1, "ioctl(KCOV_ENABLE)");
+#endif
 }
 
 int kcov_disable(struct kcov *kcov)
@@ -83,8 +103,13 @@ int kcov_disable(struct kcov *kcov)
 	int kcov_len = __atomic_load_n(&kcov->cover[0], __ATOMIC_RELAXED);
 
 	/* Stop actual couting. */
+#if defined(__OpenBSD__)
 	if (ioctl(kcov->fd, KIODISABLE) != 0)
+		err(1, "ioctl(KIODISABLE)");
+#elif defined(__linux__)
+	if (ioctl(kcov->fd, KCOV_DISABLE, 0) != 0)
 		err(1, "ioctl(KCOV_DISABLE)");
+#endif
 
 	return kcov_len;
 }
@@ -130,29 +155,43 @@ main(int argc, char **argv)
 	int		 sock, kcov_len;
 	char		 inbuf[512*1024] = {0} ;
 	size_t		 inlen, slen;
-	int i;
+	const char	*path;
+	int		 i, fd;
+	uint32_t	 pid;
 
-	k = kcov_new();
-	if (k == NULL)
-		errx(1, "kcov_new");
+	if (argc == 2)
+		path = argv[1];
 
-	kbuf = kcov_cover(k);
 
-	afl_shm_id_str = getenv("__AFL_SHM_ID");
-	if (afl_shm_id_str != NULL) {
-		int afl_shm_id = atoi(afl_shm_id_str);
-		afl_shared = shmat(afl_shm_id, NULL, 0);
+	if (path != NULL) {
+		fd = open(argv[1], O_RDONLY);
+		if (fd == -1)
+			err(1, "open()");
+	} else {
+		k = kcov_new();
+		if (k == NULL)
+			errx(1, "kcov_new");
+
+		kbuf = kcov_cover(k);
+
+		afl_shm_id_str = getenv("__AFL_SHM_ID");
+		if (afl_shm_id_str != NULL) {
+			int afl_shm_id = atoi(afl_shm_id_str);
+			afl_shared = shmat(afl_shm_id, NULL, 0);
+		}
+		printf("afl_shared: %p\n", afl_shared);
+
+		kcov_enable(k);
+
+		fd = 0;
 	}
-	printf("afl_shared: %p\n", afl_shared);
 
 	/* get input */
-	inlen = read(0, inbuf, sizeof(inbuf));
+	inlen = read(fd, inbuf, sizeof(inbuf));
 
 	/* OpenBSD expects a valid PID */
-	uint32_t pid = getpid();
+	pid = getpid();
 	memcpy(inbuf + 12, &pid, sizeof(pid));
-
-	kcov_enable(k);
 
 	sock = socket(PF_KEY, SOCK_RAW, PF_KEY_V2);
 	if (sock == -1) {
@@ -164,30 +203,33 @@ main(int argc, char **argv)
 	print_hex(inbuf, inlen);
 	slen = send(sock, inbuf, inlen, 0);
 	if (slen == -1)
-		printf("send()\n");
+		err(1, "send()\n");
 
  done:
-	kcov_len = kcov_disable(k);
 
-	/* write output */
-	previous = 0;
-	if (afl_shared != NULL) {
-		for (i = 0; i < kcov_len; i++) {
-			uint64_t current = kbuf[i + 1];
-			uint64_t hash = hsiphash_static(&current,
-							sizeof(unsigned long));
-			uint64_t mixed = (hash & 0xffff) ^ previous;
-			previous = (hash & 0xffff) >> 1;
+	if (path == NULL) {
+		kcov_len = kcov_disable(k);
 
-			uint8_t *s = &afl_shared[mixed];
-			int r = __builtin_add_overflow(*s, 1, s);
-			if (r) {
-				*s = 128;
+		/* write output */
+		previous = 0;
+		if (afl_shared != NULL) {
+			for (i = 0; i < kcov_len; i++) {
+				uint64_t current = kbuf[i + 1];
+				uint64_t hash = hsiphash_static(&current,
+								sizeof(unsigned long));
+				uint64_t mixed = (hash & 0xffff) ^ previous;
+				previous = (hash & 0xffff) >> 1;
+
+				uint8_t *s = &afl_shared[mixed];
+				int r = __builtin_add_overflow(*s, 1, s);
+				if (r) {
+					*s = 128;
+				}
 			}
 		}
-	}
 
-	kcov_free(k);
+		kcov_free(k);
+	}
 
 	return (0);
 }

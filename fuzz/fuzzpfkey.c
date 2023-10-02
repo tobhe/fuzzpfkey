@@ -128,7 +128,7 @@ unsigned long *kcov_cover(struct kcov *kcov)
 }
 
 void
-print_hex(char *buf, size_t len)
+print_hex(uint8_t *buf, size_t len)
 {
         unsigned int     i;
 
@@ -153,36 +153,40 @@ main(int argc, char **argv)
 	const char	*afl_shm_id_str;
 	uint64_t	 previous;
 	int		 sock, kcov_len;
-	char		 inbuf[512*1024] = {0} ;
+	uint8_t		 inbuf[512*1024] = {0} ;
 	size_t		 inlen, slen;
-	const char	*path;
+	const char	*path = NULL;
 	int		 i, fd;
-	uint32_t	 pid;
 
 	if (argc == 2)
 		path = argv[1];
 
+	k = kcov_new();
+	if (k == NULL)
+		errx(1, "kcov_new");
+
+	kbuf = kcov_cover(k);
+
+	afl_shm_id_str = getenv("__AFL_SHM_ID");
+	if (afl_shm_id_str != NULL) {
+		int afl_shm_id = atoi(afl_shm_id_str);
+		afl_shared = shmat(afl_shm_id, NULL, 0);
+	}
+	printf("afl_shared: %p\n", afl_shared);
+
+	kcov_enable(k);
+
+	sock = socket(PF_KEY, SOCK_RAW, PF_KEY_V2);
+	if (sock == -1) {
+		err(1, "sock: ");
+		goto done;
+	}
 
 	if (path != NULL) {
 		fd = open(argv[1], O_RDONLY);
 		if (fd == -1)
 			err(1, "open()");
 	} else {
-		k = kcov_new();
-		if (k == NULL)
-			errx(1, "kcov_new");
-
-		kbuf = kcov_cover(k);
-
-		afl_shm_id_str = getenv("__AFL_SHM_ID");
-		if (afl_shm_id_str != NULL) {
-			int afl_shm_id = atoi(afl_shm_id_str);
-			afl_shared = shmat(afl_shm_id, NULL, 0);
-		}
-		printf("afl_shared: %p\n", afl_shared);
-
-		kcov_enable(k);
-
 		fd = 0;
 	}
 
@@ -190,46 +194,50 @@ main(int argc, char **argv)
 	inlen = read(fd, inbuf, sizeof(inbuf));
 
 	/* OpenBSD expects a valid PID */
-	pid = getpid();
-	memcpy(inbuf + 12, &pid, sizeof(pid));
+	struct sadb_msg *msg = (struct sadb_msg *)inbuf;
+	msg->sadb_msg_version = PF_KEY_V2;
+	msg->sadb_msg_pid = getpid();
+	printf("pid = %x\n", msg->sadb_msg_pid);
+	msg->sadb_msg_len = inlen / 8;
 
-	sock = socket(PF_KEY, SOCK_RAW, PF_KEY_V2);
-	if (sock == -1) {
-		err(1, "sock");
+	printf("sending: len=%zu: ", inlen);
+	print_hex(inbuf, inlen);
+	slen = write(sock, inbuf, inlen);
+	if (slen == -1) {
+		err(1, "write():");
 		goto done;
 	}
 
-	printf("inbuf: ");
+	inlen = read(fd, inbuf, sizeof(inbuf));
+	if (inlen == -1) {
+		err(1, "read(): ");
+		goto done;
+	}
+	printf("recv: len=%zu: ", inlen);
 	print_hex(inbuf, inlen);
-	slen = send(sock, inbuf, inlen, 0);
-	if (slen == -1)
-		err(1, "send()\n");
-
  done:
 
-	if (path == NULL) {
-		kcov_len = kcov_disable(k);
+	kcov_len = kcov_disable(k);
 
-		/* write output */
-		previous = 0;
-		if (afl_shared != NULL) {
-			for (i = 0; i < kcov_len; i++) {
-				uint64_t current = kbuf[i + 1];
-				uint64_t hash = hsiphash_static(&current,
-								sizeof(unsigned long));
-				uint64_t mixed = (hash & 0xffff) ^ previous;
-				previous = (hash & 0xffff) >> 1;
+	/* write output */
+	previous = 0;
+	if (afl_shared != NULL) {
+		for (i = 0; i < kcov_len; i++) {
+			uint64_t current = kbuf[i + 1];
+			uint64_t hash = hsiphash_static(&current,
+							sizeof(unsigned long));
+			uint64_t mixed = (hash & 0xffff) ^ previous;
+			previous = (hash & 0xffff) >> 1;
 
-				uint8_t *s = &afl_shared[mixed];
-				int r = __builtin_add_overflow(*s, 1, s);
-				if (r) {
-					*s = 128;
-				}
+			uint8_t *s = &afl_shared[mixed];
+			int r = __builtin_add_overflow(*s, 1, s);
+			if (r) {
+				*s = 128;
 			}
 		}
-
-		kcov_free(k);
 	}
+
+	kcov_free(k);
 
 	return (0);
 }

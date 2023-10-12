@@ -1,11 +1,7 @@
-CFLAGS=		-D_DEFAULT_SOURCE -D_GNU_SOURCE \
-		-Wall
-
-.PHONY: all clean install
 all:	fuzzpfkey
 
-fuzzpfkey: fuzzpfkey.c siphash.c
-	$(CC) $(CFLAGS) $? $(LDFLAGS) -o $@
+fuzzpfkey:	fuzzpfkey.c siphash.c
+	$(CC) -I../../include $^ -o fuzzpfkey
 
 clean:
-	rm -f fuzzpfkey fuzzpfkey.o out
+	rm -f fuzzpfkey
